@@ -45,58 +45,51 @@ private:
 	void InitSample();
 
 	// ---------------------------------------------------------------------------
-	// Band-limited low-pass filter: windowed-sinc FIR with Lanczos-2 window.
+	// Gaussian interpolation filter (FIR with Gaussian kernel).
 	//
-	// Design parameters
-	//   kFirTaps  – number of FIR coefficients (must be a power of 2 so the
-	//               ring-buffer index wrap is a single AND)
-	//   kLanczosA – Lanczos window lobe count (2 = Lanczos-2, standard choice)
+	// Each coefficient:  g[n] = exp( -0.5 * ((n - M) / sigma)^2 )
+	// then normalised to unity DC gain.
 	//
-	// Coefficients are rebuilt lazily in _RebuildFir() whenever cutoff or
-	// sample-rate changes (_firDirty = true).  Per-sample cost is kFirTaps
-	// MACs on a ring buffer of uint8 inputs.
+	// sigma controls the smoothing width in samples:
+	//   small sigma  -> narrow bell -> less smoothing (more transient detail)
+	//   large sigma  -> wide bell   -> heavy smoothing (more DMC step rounding)
+	//
+	// The SetDmcFilterCutoff(sigmaHz, sampleRateHz) interface is preserved:
+	//   sigma_samples = sampleRateHz / sigmaHz
+	// so callers can keep thinking in Hz while the kernel works in samples.
+	//
+	// kGaussTaps must be a power of 2 for the ring-buffer AND-wrap trick.
+	// Increase to 32 for heavier low-end smoothing at low sigma values.
 	// ---------------------------------------------------------------------------
-	static constexpr double kPI       = 3.14159265358979323846;
-	static constexpr int    kFirTaps  = 16;   // power-of-2; raise for steeper roll-off
-	static constexpr int    kLanczosA = 2;
+	static constexpr int kGaussTaps = 16;   // power-of-2
 
-	double  _firCutoffHz      = 800.0;
-	double  _firSampleRate    = 48000.0;
+	double  _gaussSigmaHz     = 800.0;      // stored as Hz; converted on rebuild
+	double  _gaussSampleRate  = 48000.0;
 	bool    _dmcFilterEnabled = true;
 
-	bool    _firDirty         = true;
-	double  _firCoeffs[kFirTaps] = {};
+	bool    _gaussDirty       = true;
+	double  _gaussCoeffs[kGaussTaps] = {};
 
-	uint8_t _firBuf[kFirTaps] = {};  // ring buffer of recent raw DMC outputs
-	int     _firBufHead       = 0;   // index of the oldest entry (write position)
+	uint8_t _gaussBuf[kGaussTaps] = {};     // ring buffer of recent raw DMC outputs
+	int     _gaussBufHead     = 0;          // oldest entry / next write position
 
-	// Lanczos window kernel – defined inline, no state
-	static inline double _Lanczos(double x, int a)
-	{
-		if(x == 0.0)              return 1.0;
-		if(x <= -a || x >= a)     return 0.0;
-		const double pix  = kPI * x;
-		const double pixa = kPI * x / a;
-		return (std::sin(pix) / pix) * (std::sin(pixa) / pixa);
-	}
+	// Out-of-line: rebuilds _gaussCoeffs from current sigma / sample-rate
+	void _RebuildGauss();
 
-	// Out-of-line: rebuilds _firCoeffs from current cutoff/rate parameters
-	void _RebuildFir();
-
-	// Push `raw` into the ring buffer then convolve with _firCoeffs
+	// Push `raw` into the ring buffer then convolve with _gaussCoeffs
 	inline uint8_t _ApplyLpf(uint8_t raw)
 	{
-		_firBuf[_firBufHead] = raw;
-		_firBufHead = (_firBufHead + 1) & (kFirTaps - 1);
+		_gaussBuf[_gaussBufHead] = raw;
+		_gaussBufHead = (_gaussBufHead + 1) & (kGaussTaps - 1);
 
-		if(_firDirty) _RebuildFir();
+		if(_gaussDirty) _RebuildGauss();
 
 		if(!_dmcFilterEnabled) return raw;
 
 		double acc = 0.0;
-		for(int i = 0; i < kFirTaps; ++i) {
-			const int idx = (_firBufHead + i) & (kFirTaps - 1);
-			acc += _firCoeffs[i] * static_cast<double>(_firBuf[idx]);
+		for(int i = 0; i < kGaussTaps; ++i) {
+			const int idx = (_gaussBufHead + i) & (kGaussTaps - 1);
+			acc += _gaussCoeffs[i] * static_cast<double>(_gaussBuf[idx]);
 		}
 
 		int y = static_cast<int>(std::lround(acc));
@@ -135,16 +128,17 @@ public:
 	}
 
 	// control (can be called from apu init or ui)
+	// cutoffHz is repurposed as sigmaHz: sigma_samples = sampleRateHz / cutoffHz
 	inline void SetDmcFilterCutoff(double cutoffHz, double sampleRateHz)
 	{
-		_firCutoffHz   = cutoffHz;
-		_firSampleRate = sampleRateHz;
-		_firDirty      = true;   // recompute coefficients on next _ApplyLpf call
+		_gaussSigmaHz    = cutoffHz;
+		_gaussSampleRate = sampleRateHz;
+		_gaussDirty      = true;
 	}
 	inline void EnableDmcFilter(bool enabled)
 	{
 		_dmcFilterEnabled = enabled;
-		_firDirty         = true;
+		_gaussDirty       = true;
 	}
 
 	ApuDmcState GetState();

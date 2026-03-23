@@ -12,9 +12,10 @@ DeltaModulationChannel::DeltaModulationChannel(NesConsole* console)
 {
 	_console = console;
 
-	// lfp state initilization
-	_dmcLpfY = static_cast<double>(_outputLevel) / 127.0;
-	_dmcLpfA = -1.0; // lazy compute on first use
+	// pre-fill ring buffer with the initial output level (silence = 0)
+	for(int i = 0; i < kFirTaps; ++i) _firBuf[i] = _outputLevel;
+	_firBufHead = 0;
+	_firDirty   = true;  // coefficients built on first _ApplyLpf call
 }
 
 void DeltaModulationChannel::Reset(bool softReset)
@@ -44,9 +45,10 @@ void DeltaModulationChannel::Reset(bool softReset)
 
 	_lastValue4011 = 0;
 
-	// initialize filter state on reset
-	_dmcLpfY = static_cast<double>(_outputLevel) / 127.0;
-	_dmcLpfA = -1.0; // recompute next use
+	// reset FIR ring buffer to the current (silent) output level
+	for(int i = 0; i < kFirTaps; ++i) _firBuf[i] = _outputLevel;
+	_firBufHead = 0;
+	_firDirty   = true;
 
 	_timer.SetPeriod(
 		 (NesApu::GetApuRegion(_console) == ConsoleRegion::Ntsc
@@ -62,6 +64,39 @@ void DeltaModulationChannel::InitSample()
 	_currentAddr = _sampleAddr;
 	_bytesRemaining = _sampleLength;
 	_needToRun |= _bytesRemaining > 0;
+}
+
+void DeltaModulationChannel::_RebuildFir()
+{
+	_firDirty = false;
+
+	if(!_dmcFilterEnabled || _firCutoffHz <= 0.0 || _firSampleRate <= 0.0) {
+		for(int i = 0; i < kFirTaps; ++i) _firCoeffs[i] = 0.0;
+		_firCoeffs[kFirTaps / 2] = 1.0;   // identity: pass through unchanged
+		return;
+	}
+
+	const double fc = _firCutoffHz / _firSampleRate;  // normalised cutoff (0..0.5)
+	const double M  = (kFirTaps - 1) * 0.5;          // fractional centre index
+
+	double sum = 0.0;
+	for(int n = 0; n < kFirTaps; ++n) {
+		const double t = n - M;
+		double h;
+		if(std::abs(t) < 1e-12) {
+			h = 2.0 * fc;
+		} else {
+			h = std::sin(2.0 * kPI * fc * t) / (kPI * t);
+		}
+		h *= _Lanczos(t / M * kLanczosA, kLanczosA);
+		_firCoeffs[n] = h;
+		sum += h;
+	}
+
+	// normalise to unity DC gain
+	if(sum > 1e-12) {
+		for(int i = 0; i < kFirTaps; ++i) _firCoeffs[i] /= sum;
+	}
 }
 
 void DeltaModulationChannel::StartDmcTransfer()

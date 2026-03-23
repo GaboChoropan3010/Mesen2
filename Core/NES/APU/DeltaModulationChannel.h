@@ -44,44 +44,65 @@ private:
 
 	void InitSample();
 
-	// Applies the low-pass filter to `raw` (0..127), updates _dmcLpfY,
-	// and returns the filtered value.  Returns `raw` unchanged when the
-	// filter is disabled or the coefficient hasn't been computed yet.
+	// ---------------------------------------------------------------------------
+	// Band-limited low-pass filter: windowed-sinc FIR with Lanczos-2 window.
+	//
+	// Design parameters
+	//   kFirTaps  – number of FIR coefficients (must be a power of 2 so the
+	//               ring-buffer index wrap is a single AND)
+	//   kLanczosA – Lanczos window lobe count (2 = Lanczos-2, standard choice)
+	//
+	// Coefficients are rebuilt lazily in _RebuildFir() whenever cutoff or
+	// sample-rate changes (_firDirty = true).  Per-sample cost is kFirTaps
+	// MACs on a ring buffer of uint8 inputs.
+	// ---------------------------------------------------------------------------
+	static constexpr double kPI       = 3.14159265358979323846;
+	static constexpr int    kFirTaps  = 16;   // power-of-2; raise for steeper roll-off
+	static constexpr int    kLanczosA = 2;
+
+	double  _firCutoffHz      = 800.0;
+	double  _firSampleRate    = 48000.0;
+	bool    _dmcFilterEnabled = true;
+
+	bool    _firDirty         = true;
+	double  _firCoeffs[kFirTaps] = {};
+
+	uint8_t _firBuf[kFirTaps] = {};  // ring buffer of recent raw DMC outputs
+	int     _firBufHead       = 0;   // index of the oldest entry (write position)
+
+	// Lanczos window kernel – defined inline, no state
+	static inline double _Lanczos(double x, int a)
+	{
+		if(x == 0.0)              return 1.0;
+		if(x <= -a || x >= a)     return 0.0;
+		const double pix  = kPI * x;
+		const double pixa = kPI * x / a;
+		return (std::sin(pix) / pix) * (std::sin(pixa) / pixa);
+	}
+
+	// Out-of-line: rebuilds _firCoeffs from current cutoff/rate parameters
+	void _RebuildFir();
+
+	// Push `raw` into the ring buffer then convolve with _firCoeffs
 	inline uint8_t _ApplyLpf(uint8_t raw)
 	{
-		_EnsureDmcCoeff();
-		if(!_dmcFilterEnabled || _dmcLpfA <= 0.0) return raw;
-		const double x = static_cast<double>(raw) / 127.0;
-		_dmcLpfY += _dmcLpfA * (x - _dmcLpfY);
-		int y = static_cast<int>(std::lround(_dmcLpfY * 127.0));
+		_firBuf[_firBufHead] = raw;
+		_firBufHead = (_firBufHead + 1) & (kFirTaps - 1);
+
+		if(_firDirty) _RebuildFir();
+
+		if(!_dmcFilterEnabled) return raw;
+
+		double acc = 0.0;
+		for(int i = 0; i < kFirTaps; ++i) {
+			const int idx = (_firBufHead + i) & (kFirTaps - 1);
+			acc += _firCoeffs[i] * static_cast<double>(_firBuf[idx]);
+		}
+
+		int y = static_cast<int>(std::lround(acc));
 		if(y < 0)   y = 0;
 		if(y > 127) y = 127;
 		return static_cast<uint8_t>(y);
-	}
-
-	// low pass filter state
-	// lower cutoff = smooth/quieter / higher cutoff = more noise/louder
-	static constexpr double kPI = 3.14159265358979323846;
-	double _dmcLpfY = 0.0;                 // filter state
-	double _dmcLpfA = -1.0;                // coeff (init state)
-	double _dmcLpfCutoff = 800.0;         // filter out freq (hz)
-	double _dmcLpfSampleRate = 48000.0;    // output rate 
-	bool   _dmcFilterEnabled = true;
-
-	inline void _EnsureDmcCoeff()
-	{
-		if(!_dmcFilterEnabled) { _dmcLpfA = 0.0; return; }
-		if(_dmcLpfA >= 0.0) { return; } // already computed
-
-		if(_dmcLpfCutoff <= 0.0 || _dmcLpfSampleRate <= 0.0) {
-			_dmcLpfA = 0.0; // bypass
-			return;
-		}
-		const double x = -2.0 * kPI * _dmcLpfCutoff / _dmcLpfSampleRate;
-		double a = 1.0 - std::exp(x);
-		if(a < 0.0) a = 0.0;
-		if(a > 1.0) a = 1.0;
-		_dmcLpfA = a;
 	}
 
 public:
@@ -116,14 +137,14 @@ public:
 	// control (can be called from apu init or ui)
 	inline void SetDmcFilterCutoff(double cutoffHz, double sampleRateHz)
 	{
-		_dmcLpfCutoff = cutoffHz;
-		_dmcLpfSampleRate = sampleRateHz;
-		_dmcLpfA = -1.0;        // force recompute on next GetOutput() func 
+		_firCutoffHz   = cutoffHz;
+		_firSampleRate = sampleRateHz;
+		_firDirty      = true;   // recompute coefficients on next _ApplyLpf call
 	}
 	inline void EnableDmcFilter(bool enabled)
 	{
 		_dmcFilterEnabled = enabled;
-		_dmcLpfA = -1.0;        // force recompute
+		_firDirty         = true;
 	}
 
 	ApuDmcState GetState();

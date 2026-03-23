@@ -44,6 +44,21 @@ private:
 
 	void InitSample();
 
+	// Applies the low-pass filter to `raw` (0..127), updates _dmcLpfY,
+	// and returns the filtered value.  Returns `raw` unchanged when the
+	// filter is disabled or the coefficient hasn't been computed yet.
+	inline uint8_t _ApplyLpf(uint8_t raw)
+	{
+		_EnsureDmcCoeff();
+		if(!_dmcFilterEnabled || _dmcLpfA <= 0.0) return raw;
+		const double x = static_cast<double>(raw) / 127.0;
+		_dmcLpfY += _dmcLpfA * (x - _dmcLpfY);
+		int y = static_cast<int>(std::lround(_dmcLpfY * 127.0));
+		if(y < 0)   y = 0;
+		if(y > 127) y = 127;
+		return static_cast<uint8_t>(y);
+	}
+
 	// low pass filter state
 	// lower cutoff = smooth/quieter / higher cutoff = more noise/louder
 	static constexpr double kPI = 3.14159265358979323846;
@@ -91,20 +106,11 @@ public:
 	uint16_t GetDmcReadAddress();
 	void SetDmcReadBuffer(uint8_t value);
 
-	// filtered output; mixer calls active
+	// filtered output; filter is applied in Run() and WriteRam() before
+	// AddOutput(), so GetLastOutput() already carries the filtered value.
 	uint8_t GetOutput()
 	{
-		const uint8_t raw = _timer.GetLastOutput();
-
-		_EnsureDmcCoeff();                  // lazy init/bypass coeff
-		if(_dmcLpfA <= 0.0) return raw;    // bypass if disabled or invalid
-
-		const double x = static_cast<double>(raw) / 127.0;  // normalize to 0..1
-		_dmcLpfY += _dmcLpfA * (x - _dmcLpfY);
-		int y = static_cast<int>(std::lround(_dmcLpfY * 127.0));
-		if(y < 0)   y = 0;
-		if(y > 127) y = 127;
-		return static_cast<uint8_t>(y);
+		return _timer.GetLastOutput();
 	}
 
 	// control (can be called from apu init or ui)

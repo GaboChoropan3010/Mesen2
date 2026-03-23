@@ -90,6 +90,19 @@ public:
 		_timer = timer;
 	}
 
+	uint32_t GetPreviousCycle()
+	{
+		return _previousCycle;
+	}
+
+	// Directly update _lastOutput without triggering an AddDelta call.
+	// Used by the DMC Gaussian pre-filter, which issues its own AddDelta calls
+	// at sub-period granularity and must keep _lastOutput in sync afterwards.
+	void SetLastOutput(int8_t output)
+	{
+		_lastOutput = output;
+	}
+
 	__forceinline void EndFrame()
 	{
 		_previousCycle = 0;

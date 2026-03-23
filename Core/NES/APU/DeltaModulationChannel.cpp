@@ -7,15 +7,10 @@
 #include "NES/NesConsole.h"
 #include "NES/NesMemoryManager.h"
 
-DeltaModulationChannel::DeltaModulationChannel(NesConsole* console)
-	: _timer(AudioChannel::DMC, console->GetSoundMixer())
+DeltaModulationChannel::DeltaModulationChannel(NesConsole* console) : _timer(AudioChannel::DMC, console->GetSoundMixer())
 {
-	_console = console;
-
-	// pre-fill ring buffer with the initial output level (silence = 0)
-	for(int i = 0; i < kGaussTaps; ++i) _gaussBuf[i] = _outputLevel;
-	_gaussBufHead = 0;
-	_gaussDirty   = true;  // coefficients built on first _ApplyLpf call
+	_console     = console;
+	_gaussDirty  = true;
 }
 
 void DeltaModulationChannel::Reset(bool softReset)
@@ -23,6 +18,8 @@ void DeltaModulationChannel::Reset(bool softReset)
 	_timer.Reset(softReset);
 
 	if(!softReset) {
+		//At power on, the sample address is set to $C000 and the sample length is set to 1
+		//Resetting does not reset their value
 		_sampleAddr = 0xC000;
 		_sampleLength = 1;
 	}
@@ -45,17 +42,13 @@ void DeltaModulationChannel::Reset(bool softReset)
 
 	_lastValue4011 = 0;
 
-	// reset Gaussian ring buffer to the current (silent) output level
-	for(int i = 0; i < kGaussTaps; ++i) _gaussBuf[i] = _outputLevel;
-	_gaussBufHead = 0;
-	_gaussDirty   = true;
+	_gaussDirty = true;  // recompute weights on next tick
 
-	_timer.SetPeriod(
-		 (NesApu::GetApuRegion(_console) == ConsoleRegion::Ntsc
-			 ? _dmcPeriodLookupTableNtsc
-			 : _dmcPeriodLookupTablePal)[0] -
-		 1);
-
+	//Not sure if this is accurate, but it seems to make things better rather than worse (for dpcmletterbox)
+	//"On the real thing, I think the power-on value is 428 (or the equivalent at least - it uses a linear feedback shift register), though only the even/oddness should matter for this test."
+	_timer.SetPeriod((NesApu::GetApuRegion(_console) == ConsoleRegion::Ntsc ? _dmcPeriodLookupTableNtsc : _dmcPeriodLookupTablePal)[0] - 1);
+	
+	//Make sure the DMC doesn't tick on the first cycle - this is part of what keeps Sprite/DMC DMA tests working while fixing dmc_pitch.
 	_timer.SetTimer(_timer.GetPeriod());
 }
 
@@ -70,32 +63,22 @@ void DeltaModulationChannel::_RebuildGauss()
 {
 	_gaussDirty = false;
 
-	if(!_dmcFilterEnabled || _gaussSigmaHz <= 0.0 || _gaussSampleRate <= 0.0) {
-		// identity: all weight on the centre tap, bypass smoothing
-		for(int i = 0; i < kGaussTaps; ++i) _gaussCoeffs[i] = 0.0;
-		_gaussCoeffs[kGaussTaps / 2] = 1.0;
-		return;
-	}
-
-	// Convert sigma from Hz to samples.
-	// A higher sigmaHz value means a narrower bell (less smoothing).
-	// A lower sigmaHz value means a wider bell (more smoothing).
-	const double sigma = _gaussSampleRate / _gaussSigmaHz;
-	const double M     = (kGaussTaps - 1) * 0.5;   // centre index (fractional)
-	const double inv2s2 = 1.0 / (2.0 * sigma * sigma);
+	// Centre of the bell is at the midpoint of the tap array.
+	const double M      = (kGaussTaps - 1) * 0.5;
+	const double inv2s2 = 1.0 / (2.0 * _gaussSigma * _gaussSigma);
 
 	double sum = 0.0;
-	for(int n = 0; n < kGaussTaps; ++n) {
-		const double t  = n - M;
+	for(int i = 0; i < kGaussTaps; ++i) {
+		const double t  = i - M;
 		const double g  = std::exp(-t * t * inv2s2);
-		_gaussCoeffs[n] = g;
+		_gaussWeights[i] = g;
 		sum += g;
 	}
 
-	// normalise to unity DC gain so the filter doesn't attenuate the signal
-	if(sum > 1e-12) {
-		for(int i = 0; i < kGaussTaps; ++i) _gaussCoeffs[i] /= sum;
-	}
+	// Normalise to unity so total energy == 1 and DC gain is preserved
+	if(sum > 1e-12)
+		for(int i = 0; i < kGaussTaps; ++i)
+			_gaussWeights[i] /= sum;
 }
 
 void DeltaModulationChannel::StartDmcTransfer()
@@ -116,6 +99,7 @@ void DeltaModulationChannel::SetDmcReadBuffer(uint8_t value)
 		_readBuffer = value;
 		_bufferEmpty = false;
 
+		//"The address is incremented; if it exceeds $FFFF, it is wrapped around to $8000."
 		_currentAddr++;
 		if(_currentAddr == 0) {
 			_currentAddr = 0x8000;
@@ -125,6 +109,7 @@ void DeltaModulationChannel::SetDmcReadBuffer(uint8_t value)
 
 		if(_bytesRemaining == 0) {
 			if(_loopFlag) {
+				//Looped sample should never set IRQ flag
 				InitSample();
 			} else if(_irqEnabled) {
 				_console->GetCpu()->SetIrqSource(IRQSource::DMC);
@@ -133,14 +118,21 @@ void DeltaModulationChannel::SetDmcReadBuffer(uint8_t value)
 	}
 
 	if(_sampleLength == 1 && !_loopFlag) {
-		if(_bitsRemaining == 8 && _timer.GetTimer() == _timer.GetPeriod() &&
-			_console->GetNesConfig().EnableDmcSampleDuplicationGlitch) {
+		//When DMA ends around the time the bit counter resets, a CPU glitch sometimes causes another DMA to be requested immediately.
+		if(_bitsRemaining == 8 && _timer.GetTimer() == _timer.GetPeriod() && _console->GetNesConfig().EnableDmcSampleDuplicationGlitch) {
+			//When the DMA ends on the same cycle as the bit counter resets
+			//This glitch exists on all H CPUs and some G CPUs (those from around 1990 and later)
+			//In this case, a full DMA is performed on the same address, and the same sample byte 
+			//is played twice in a row by the DMC
 			_shiftRegister = _readBuffer;
 			_silenceFlag = false;
 			_bufferEmpty = true;
 			InitSample();
 			StartDmcTransfer();
 		} else if(_bitsRemaining == 1 && _timer.GetTimer() < 2) {
+			//When the DMA ends on the APU cycle before the bit counter resets
+			//If it this happens right before the bit counter resets,
+			//a DMA is triggered and aborted 1 cycle later (causing one halted CPU cycle)
 			_shiftRegister = _readBuffer;
 			_bufferEmpty = false;
 			InitSample();
@@ -163,9 +155,13 @@ void DeltaModulationChannel::Run(uint32_t targetCycle)
 			}
 
 			if(bit) {
-				if(_outputLevel <= 125) _outputLevel += 2;
+				if(_outputLevel <= 125) {
+					_outputLevel += 2;
+				}
 			} else {
-				if(_outputLevel >= 2) _outputLevel -= 2;
+				if(_outputLevel >= 2) {
+					_outputLevel -= 2;
+				}
 			}
 		}
 
@@ -180,20 +176,33 @@ void DeltaModulationChannel::Run(uint32_t targetCycle)
 				_bufferEmpty = true;
 				_needToRun = true;
 				if(_transferStartDelay == 0) {
+					//Don't trigger the DMA if the channel was just enabled by a 4015 write
+					//The DMA will be triggered later (see ProcessClock)
+					//Based on AccuracyCoin's "Delta Modulation Channel" test result
 					StartDmcTransfer();
 				}
 			}
 		}
 
-		_timer.AddOutput(_ApplyLpf(_outputLevel));
+		// Spread this output step as a Gaussian ramp across the DMC period so
+		// the blip-buffer receives smooth sub-steps rather than a hard impulse.
+		{
+			const int8_t prev    = _timer.GetLastOutput();
+			const int8_t current = static_cast<int8_t>(_outputLevel);
+			const int8_t delta   = current - prev;
+			if(delta != 0) {
+				_GaussianAddDelta(AudioChannel::DMC, _console->GetSoundMixer(),
+				                  _timer.GetPreviousCycle(), _timer.GetPeriod(), delta);
+				_timer.SetLastOutput(current);
+			}
+		}
 	}
 }
 
 bool DeltaModulationChannel::IrqPending(uint32_t cyclesToRun)
 {
 	if(_irqEnabled && _bytesRemaining > 0) {
-		uint32_t cyclesToEmptyBuffer =
-			(_bitsRemaining + (_bytesRemaining - 1) * 8) * _timer.GetPeriod();
+		uint32_t cyclesToEmptyBuffer = (_bitsRemaining + (_bytesRemaining-1)* 8) * _timer.GetPeriod();
 		if(cyclesToRun >= cyclesToEmptyBuffer) {
 			return true;
 		}
@@ -206,7 +215,7 @@ bool DeltaModulationChannel::GetStatus()
 	return _bytesRemaining > 0;
 }
 
-void DeltaModulationChannel::GetMemoryRanges(MemoryRanges& ranges)
+void DeltaModulationChannel::GetMemoryRanges(MemoryRanges &ranges)
 {
 	ranges.AddHandler(MemoryOperation::Write, 0x4010, 0x4013);
 }
@@ -216,49 +225,55 @@ void DeltaModulationChannel::WriteRam(uint16_t addr, uint8_t value)
 	_console->GetApu()->Run();
 
 	switch(addr & 0x03) {
-		case 0: // 4010
-			_irqEnabled = (value & 0x80) != 0;
-			_loopFlag = (value & 0x40) != 0;
+		case 0:		//4010
+			_irqEnabled = (value & 0x80) == 0x80;
+			_loopFlag = (value & 0x40) == 0x40;
 
-			_timer.SetPeriod(
-				 (NesApu::GetApuRegion(_console) == ConsoleRegion::Ntsc
-					 ? _dmcPeriodLookupTableNtsc
-					 : _dmcPeriodLookupTablePal)[value & 0x0F] -
-				 1);
+			//"The rate determines for how many CPU cycles happen between changes in the output level during automatic delta-encoded sample playback."
+			//Because BaseApuChannel does not decrement when setting _timer, we need to actually set the value to 1 less than the lookup table
+			_timer.SetPeriod((NesApu::GetApuRegion(_console) == ConsoleRegion::Ntsc ? _dmcPeriodLookupTableNtsc : _dmcPeriodLookupTablePal)[value & 0x0F] - 1);
 
 			if(!_irqEnabled) {
 				_console->GetCpu()->ClearIrqSource(IRQSource::DMC);
 			}
 			break;
 
-		case 1:
-		{ // 4011
+		case 1: {		//4011
 			uint8_t newValue = value & 0x7F;
 			uint8_t previousLevel = _outputLevel;
 			_outputLevel = newValue;
-
-			if(_console->GetNesConfig().ReduceDmcPopping &&
-				abs(_outputLevel - previousLevel) > 50) {
+			
+			if(_console->GetNesConfig().ReduceDmcPopping && abs(_outputLevel - previousLevel) > 50) {
+				//Reduce popping sounds for 4011 writes
 				_outputLevel -= (_outputLevel - previousLevel) / 2;
 			}
 
-			_timer.AddOutput(_ApplyLpf(_outputLevel));
-
+			//4011 applies new output right away, not on the timer's reload.  This fixes bad DMC sound when playing through 4011.
+			// $4011 is a register write — it happens at a precise cycle, not a
+			// periodic step, so we issue it as a single AddDelta rather than
+			// spreading it. The Gaussian pre-filter is for the periodic DPCM steps.
+			_timer.AddOutput(_outputLevel);
+			
 			if(_lastValue4011 != value && newValue > 0) {
 				_console->SetNextFrameOverclockStatus(true);
 			}
+
 			_lastValue4011 = newValue;
 			break;
 		}
 
-		case 2: // 4012
+		case 2:		//4012
 			_sampleAddr = 0xC000 | ((uint32_t)value << 6);
-			if(value > 0) _console->SetNextFrameOverclockStatus(false);
+			if(value > 0) {
+				_console->SetNextFrameOverclockStatus(false);
+			}
 			break;
 
-		case 3: // 4013
+		case 3:		//4013
 			_sampleLength = (value << 4) | 0x0001;
-			if(value > 0) _console->SetNextFrameOverclockStatus(false);
+			if(value > 0) {
+				_console->SetNextFrameOverclockStatus(false);
+			}
 			break;
 	}
 }
@@ -272,6 +287,9 @@ void DeltaModulationChannel::SetEnabled(bool enabled)
 {
 	if(!enabled) {
 		if(_disableDelay == 0) {
+			//Disabling takes effect with a 1 apu cycle delay
+			//If a DMA starts during this time, it gets cancelled
+			//but this will still cause the CPU to be halted for 1 cycle
 			if((_console->GetCpu()->GetCycleCount() & 0x01) == 0) {
 				_disableDelay = 2;
 			} else {
@@ -281,7 +299,9 @@ void DeltaModulationChannel::SetEnabled(bool enabled)
 		_needToRun = true;
 	} else if(_bytesRemaining == 0) {
 		InitSample();
-
+		
+		//Delay a number of cycles based on odd/even cycles
+		//Allows behavior to match dmc_dma_start_test
 		if((_console->GetCpu()->GetCycleCount() & 0x01) == 0) {
 			_transferStartDelay = 2;
 		} else {
@@ -296,6 +316,8 @@ void DeltaModulationChannel::ProcessClock()
 	if(_disableDelay && --_disableDelay == 0) {
 		_disableDelay = 0;
 		_bytesRemaining = 0;
+
+		//Abort any on-going transfer that hasn't fully started
 		_console->GetCpu()->StopDmcTransfer();
 	}
 
@@ -323,9 +345,7 @@ ApuDmcState DeltaModulationChannel::GetState()
 	state.OutputVolume = _timer.GetLastOutput();
 	state.Period = _timer.GetPeriod();
 	state.Timer = _timer.GetTimer();
-	state.SampleRate =
-		(double)NesConstants::GetClockRate(NesApu::GetApuRegion(_console)) /
-		(_timer.GetPeriod() + 1);
+	state.SampleRate = (double)NesConstants::GetClockRate(NesApu::GetApuRegion(_console)) / (_timer.GetPeriod() + 1);
 	state.SampleAddr = _sampleAddr;
 	state.NextSampleAddr = _currentAddr;
 	state.SampleLength = _sampleLength;

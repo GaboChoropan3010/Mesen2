@@ -44,58 +44,77 @@ private:
 
 	void InitSample();
 
-	// ---------------------------------------------------------------------------
-	// Gaussian interpolation filter (FIR with Gaussian kernel).
+	// -------------------------------------------------------------------------
+	// Gaussian pre-filter (anti-aliasing at the blip-buffer layer)
 	//
-	// Each coefficient:  g[n] = exp( -0.5 * ((n - M) / sigma)^2 )
-	// then normalised to unity DC gain.
+	// WHY HERE:
+	//   AddOutput() calls _mixer->AddDelta() which records a hard step impulse
+	//   at a precise CPU cycle timestamp into the blip-buffer. The blip-buffer
+	//   then integrates those impulses into the audio frame. Any filter applied
+	//   AFTER AddOutput (e.g. on _lastOutput) never touches the waveform already
+	//   recorded in the buffer — it only affects the $401A debug read. Aliasing
+	//   originates at the impulse, so the filter must run BEFORE AddDelta.
 	//
-	// sigma controls the smoothing width in samples:
-	//   small sigma  -> narrow bell -> less smoothing (more transient detail)
-	//   large sigma  -> wide bell   -> heavy smoothing (more DMC step rounding)
+	// HOW IT WORKS:
+	//   On each DMC timer tick, instead of one AddDelta(±2) call, we spread the
+	//   step energy across kGaussTaps evenly-spaced sub-steps within the DMC
+	//   period. Each sub-step contributes (weight[i] * delta) to AddDelta at an
+	//   interpolated cycle timestamp. The blip-buffer receives a Gaussian ramp
+	//   rather than a hard impulse, eliminating the alias before integration.
 	//
-	// The SetDmcFilterCutoff(sigmaHz, sampleRateHz) interface is preserved:
-	//   sigma_samples = sampleRateHz / sigmaHz
-	// so callers can keep thinking in Hz while the kernel works in samples.
+	//   Weights are precomputed (lazy, _gaussDirty flag). Per-tick cost is
+	//   kGaussTaps small AddDelta calls; because AddDelta is a no-op when
+	//   delta == 0 and weights are normalised, DC gain is preserved exactly.
 	//
-	// kGaussTaps must be a power of 2 for the ring-buffer AND-wrap trick.
-	// Increase to 32 for heavier low-end smoothing at low sigma values.
-	// ---------------------------------------------------------------------------
-	static constexpr int kGaussTaps = 16;   // power-of-2
+	// PARAMETERS:
+	//   kGaussTaps  — spread width in sub-steps (power-of-2 not required here)
+	//   _gaussSigma — std-dev of the bell in sub-steps; larger = more smoothing
+	// -------------------------------------------------------------------------
+	static constexpr double kPI        = 3.14159265358979323846;
+	static constexpr int    kGaussTaps = 16;
 
-	double  _gaussSigmaHz     = 800.0;      // stored as Hz; converted on rebuild
-	double  _gaussSampleRate  = 48000.0;
-	bool    _dmcFilterEnabled = true;
+	double _gaussSigma       = 4.0;   // bell width in sub-steps
+	bool   _dmcFilterEnabled = true;
+	bool   _gaussDirty       = true;
+	double _gaussWeights[kGaussTaps] = {};
 
-	bool    _gaussDirty       = true;
-	double  _gaussCoeffs[kGaussTaps] = {};
-
-	uint8_t _gaussBuf[kGaussTaps] = {};     // ring buffer of recent raw DMC outputs
-	int     _gaussBufHead     = 0;          // oldest entry / next write position
-
-	// Out-of-line: rebuilds _gaussCoeffs from current sigma / sample-rate
 	void _RebuildGauss();
 
-	// Push `raw` into the ring buffer then convolve with _gaussCoeffs
-	inline uint8_t _ApplyLpf(uint8_t raw)
+	inline void _GaussianAddDelta(AudioChannel channel, NesSoundMixer* mixer,
+	                               uint32_t periodStart, uint16_t period,
+	                               int8_t delta)
 	{
-		_gaussBuf[_gaussBufHead] = raw;
-		_gaussBufHead = (_gaussBufHead + 1) & (kGaussTaps - 1);
+		if(!_dmcFilterEnabled || period == 0) {
+			mixer->AddDelta(channel, periodStart, delta);
+			return;
+		}
 
 		if(_gaussDirty) _RebuildGauss();
 
-		if(!_dmcFilterEnabled) return raw;
+		const double fDelta  = static_cast<double>(delta);
+		const double fPeriod = static_cast<double>(period);
+		double remainder = 0.0;
 
-		double acc = 0.0;
 		for(int i = 0; i < kGaussTaps; ++i) {
-			const int idx = (_gaussBufHead + i) & (kGaussTaps - 1);
-			acc += _gaussCoeffs[i] * static_cast<double>(_gaussBuf[idx]);
+			uint32_t cycleOffset = static_cast<uint32_t>(
+				(static_cast<double>(i) / kGaussTaps) * fPeriod + 0.5);
+
+			double exact  = fDelta * _gaussWeights[i] + remainder;
+			int8_t iDelta = static_cast<int8_t>(exact >= 0
+			                  ? static_cast<int>(exact + 0.5)
+			                  : static_cast<int>(exact - 0.5));
+			remainder = exact - static_cast<double>(iDelta);
+
+			if(iDelta != 0)
+				mixer->AddDelta(channel, periodStart + cycleOffset, iDelta);
 		}
 
-		int y = static_cast<int>(std::lround(acc));
-		if(y < 0)   y = 0;
-		if(y > 127) y = 127;
-		return static_cast<uint8_t>(y);
+		// flush rounding residual so sum == delta exactly
+		int8_t residual = static_cast<int8_t>(
+			remainder >= 0 ? static_cast<int>(remainder + 0.5)
+			               : static_cast<int>(remainder - 0.5));
+		if(residual != 0)
+			mixer->AddDelta(channel, periodStart + period, residual);
 	}
 
 public:
@@ -120,20 +139,25 @@ public:
 	uint16_t GetDmcReadAddress();
 	void SetDmcReadBuffer(uint8_t value);
 
-	// filtered output; filter is applied in Run() and WriteRam() before
-	// AddOutput(), so GetLastOutput() already carries the filtered value.
+	// GetOutput() returns the last committed level. The Gaussian pre-filter
+	// has already shaped the waveform inside the blip-buffer; no post-processing
+	// needed here.
 	uint8_t GetOutput()
 	{
 		return _timer.GetLastOutput();
 	}
 
-	// control (can be called from apu init or ui)
-	// cutoffHz is repurposed as sigmaHz: sigma_samples = sampleRateHz / cutoffHz
+	// sigma: Gaussian bell width in sub-steps (1.0 = very sharp, 6.0+ = heavy smoothing)
+	inline void SetDmcFilterSigma(double sigma)
+	{
+		_gaussSigma  = sigma > 0.0 ? sigma : 1.0;
+		_gaussDirty  = true;
+	}
+	// Legacy shim: callers using SetDmcFilterCutoff(hz, rate) are remapped to sigma.
+	// sigma_samples = sampleRate / cutoffHz is a reasonable approximation.
 	inline void SetDmcFilterCutoff(double cutoffHz, double sampleRateHz)
 	{
-		_gaussSigmaHz    = cutoffHz;
-		_gaussSampleRate = sampleRateHz;
-		_gaussDirty      = true;
+		SetDmcFilterSigma(sampleRateHz / (cutoffHz > 0.0 ? cutoffHz : 1.0) / kGaussTaps);
 	}
 	inline void EnableDmcFilter(bool enabled)
 	{
